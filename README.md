@@ -1,1 +1,1 @@
-Som example code that I have worked on during different projects
+Some example code that I have worked on during different projects
