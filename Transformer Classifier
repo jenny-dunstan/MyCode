@@ -1,0 +1,271 @@
+import numpy as np
+import math
+
+import pytorch_lightning as pl
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, random_split
+from torchmetrics import Accuracy
+from pytorch_lightning.callbacks import EarlyStopping
+
+from einops.layers.torch import Rearrange
+from einops import repeat, pack, unpack
+
+torch.set_float32_matmul_precision('medium')
+
+#########Transformer Neural Network For Full Sequences#########
+
+
+### Generate Data ###
+
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, data, labels):
+        self.data = data
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        inputs= torch.tensor(self.data[idx]).float()
+        label = torch.tensor(self.labels[idx]).float()
+        
+        return inputs, label
+
+
+
+class DataModule(pl.LightningDataModule):
+    
+    def __init__(self, training_data, testing_data, training_labels, testing_labels, batch_size, num_workers):
+        super().__init__()
+        self.training_data = training_data
+        self.testing_data = testing_data
+        self.training_labels = training_labels
+        self.testing_labels = testing_labels
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+
+    def setup(self, stage: str):
+        print('Creating datasets...')
+        self.training_dataset = Dataset(self.training_data, self.training_labels)
+        self.train_dataset, self.val_dataset = random_split(self.training_dataset, [0.8, 0.2], generator=torch.Generator().manual_seed(1))
+        self.testing_dataset = Dataset(self.testing_data, self.testing_labels)
+            
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+
+    def test_dataloader(self):
+        return DataLoader(self.testing_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+    
+    
+
+### Build Transformer Neural Network ###
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self,n,dim):
+        super().__init__()
+
+        pos_encoding = torch.zeros(n, dim)
+        positions_list = torch.arange(0, n, dtype=torch.float).unsqueeze(1)
+        division_term = torch.exp(  torch.arange(0, dim, 2).float()* (-math.log(10000.0)/dim)  )
+        pos_encoding[:, 0::2] = torch.sin(positions_list * division_term)
+        pos_encoding[:, 1::2] = torch.cos(positions_list * division_term)
+        pos_encoding = pos_encoding.unsqueeze(0)
+        
+        # Saving buffer
+        self.register_buffer("pos_encoding",pos_encoding)
+        
+
+    def forward(self, x):
+        return self.pos_encoding
+    
+    
+    
+class FeedForward(nn.Module):
+    def __init__(self,dim,hidden_dim,trans_dropout_p):
+        super().__init__()
+        
+        self.feed_forward = nn.Sequential(nn.LayerNorm(dim),
+                                     nn.Linear(dim, hidden_dim),
+                                     nn.GELU(),
+                                     nn.Dropout(trans_dropout_p),
+                                     nn.Linear(hidden_dim, dim),
+                                     nn.Dropout(trans_dropout_p))
+        
+    def forward(self, x):
+        y = self.feed_forward(x)
+        return y
+    
+    
+    
+class Attention(nn.Module):
+    def __init__(self,dim,heads,dim_head,trans_dropout_p):
+        super().__init__()
+        
+        #Parameters:
+        inner_dim = dim_head*heads
+        self.dim_head = dim_head
+        self.dim = dim
+
+        #Layers:
+        self.input = nn.Sequential(nn.LayerNorm(dim),
+                                   nn.Linear(dim, inner_dim*3))
+        self.rearrange1 = Rearrange('b n (h d) -> b h n d', h = heads, d = 3*dim_head)
+        self.softmax = nn.Sequential(nn.Softmax(dim = -1),
+                                     nn.Dropout(trans_dropout_p))
+        self.rearrange2 = Rearrange('b h n d -> b n (h d)')
+        self.output = nn.Sequential(nn.Linear(inner_dim, dim),
+                                    nn.Dropout(trans_dropout_p))
+        
+    
+    def forward(self, x):
+        
+        x1 = self.input(x)  #batch_size*(num_patches+1)*(inner_dim*3)
+        x2 = self.rearrange1(x1) #batch_size*heads*(num_patches+1)*(dim_head*3)
+        q,k,v = torch.split(x2,self.dim_head, dim=-1)   #batch_size*heads*(num_patches+1)*dim_head
+        x3 = torch.matmul(q, k.transpose(-1, -2)) * (self.dim_head**-0.5)  #batch_size*heads*(num_patches+1)*(num_patches+1)
+        x4 = self.softmax(x3)  #batch_size*heads*(num_patches+1)*(num_patches+1)
+        x5 = torch.matmul(x4, v)  #batch_size*heads*(num_patches+1)*dim_head
+        x6 = self.rearrange2(x5)  #batch_size*(num_patches+1)*inner_dim
+        y = self.output(x6)   #batch_size*(num_patches+1)*dim
+        
+        return y
+
+    
+    
+class Transformer(nn.Module):
+    def __init__(self, batch_size, len_dets, num_det, patch_size, dim, emb_dropout_p, depth, hidden_dim, trans_dropout_p, heads, dim_head, num_classes):
+        super().__init__()
+        
+        #Parameters:
+        patch_dim = len_dets*patch_size
+        num_patches = num_det // patch_size
+        self.batch_size = batch_size
+        
+        #Layers
+        self.rearrange = Rearrange('b c (n p) -> b n (p c)', p = patch_size)
+        self.patch_embedding = nn.Sequential(nn.LayerNorm(patch_dim),
+                                        nn.Linear(patch_dim, dim),
+                                        nn.LayerNorm(dim))
+        self.cls_token = nn.Parameter(torch.randn(dim))
+        self.positional_encoder = PositionalEncoding(num_patches+1,dim)
+        self.dropout = nn.Dropout(emb_dropout_p)
+        
+        modules = nn.ModuleList([])
+        for i in range(depth):
+            modules.append(Attention(dim,heads,dim_head,trans_dropout_p))  
+            modules.append(FeedForward(dim,hidden_dim,trans_dropout_p))
+        self.transformer = modules
+
+        self.output = nn.Sequential(nn.LayerNorm(dim),
+                                    nn.Linear(dim, num_classes))
+        
+        
+    def forward(self,x):
+        
+        #Patch embedding:
+        x1 = self.rearrange(x)  #batch_size*num_patches*patch_dim
+        x2 = self.patch_embedding(x1)  #batch_size*num_patches*dim
+        
+        
+        #Class tokens and Positional encoding:
+        cls_tokens = repeat(self.cls_token, 'd -> b d', b = self.batch_size)
+        x3, ps = pack([cls_tokens, x2], 'b * d') #batch_size*(num_patches+1)*dim
+        x4 = x3 + self.positional_encoder(x3)  #batch_size*(num_patches+1)*dim
+        x5 = self.dropout(x4) #batch_size*(num_patches+1)*dim
+        
+        #Transformer:
+        for layer in self.transformer:
+            x5 = layer(x5) + x5  #batch_size*(num_patches+1)*dim
+             
+        #Output:
+        tokens, _ = unpack(x5, ps, 'b * d')  #batch_size*dim
+        logits = self.output(tokens)  #batch_size*num_classes
+        
+        return logits
+
+
+
+
+class LitModel(pl.LightningModule):
+    def __init__(self, transformer, learning_rate, momentum, num_classes):
+        super().__init__()
+        self.save_hyperparameters(ignore=['transformer'])
+        self.transformer = transformer
+        self.loss_fn = nn.CrossEntropyLoss()
+        self.accuracy = Accuracy(task="multiclass", num_classes=num_classes)
+
+
+
+    def training_step(self, batch, batch_idx):
+        features, labels = batch
+
+        y = self.transformer(features)
+
+        loss = self.loss_fn(y, labels)
+        self.log("train_loss", loss, prog_bar=True, logger=True)
+        accuracy = self.accuracy(y.argmax(1), labels.argmax(1))
+        self.log("train_accuracy", accuracy, prog_bar=True, logger=True)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        features, labels = batch
+        
+        y = self.transformer(features)
+        
+        val_loss = self.loss_fn(y, labels)
+        self.log("val_loss", val_loss, prog_bar=True, logger=True)
+        accuracy = self.accuracy(y.argmax(1), labels.argmax(1))
+        self.log("val_accuracy", accuracy, prog_bar=True, logger=True)
+
+    def test_step(self, batch, batch_idx):
+        features, labels = batch
+         
+        y = self.transformer(features)
+         
+        test_loss = self.loss_fn(y, labels)
+        self.log("test_loss", test_loss)
+        accuracy = self.accuracy(y.argmax(1), labels.argmax(1))
+        self.log("test_accuracy", accuracy)
+        
+
+    def predict_step(self, batch, batch_idx):
+        features, labels = batch
+        y = self.transformer(features)
+        
+        return y.argmax(1)
+    
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(self.parameters(), lr=self.hparams.learning_rate, momentum=self.hparams.momentum)
+        return optimizer
+
+    
+    
+### Train and Test model ###
+
+def train_test_model(training_data, testing_data, training_labels, testing_labels, batch_size, num_workers, num_det, len_dets, patch_size, dim, emb_dropout_p, depth, hidden_dim, trans_dropout_p, heads, dim_head, num_classes, learning_rate, momentum, epochs, log_num):
+    
+    print('Preparing model...')
+    datamodule = DataModule(training_data, testing_data, training_labels, testing_labels, batch_size, num_workers)
+    model = LitModel(Transformer(batch_size,len_dets,num_det,patch_size,dim,emb_dropout_p,depth,hidden_dim,trans_dropout_p,heads,dim_head,num_classes), learning_rate, momentum, num_classes)
+
+    print('Training model...')
+    trainer = pl.Trainer(max_epochs=epochs, 
+                         logger=pl.loggers.CSVLogger("log files", name=None, version=log_num), 
+                         log_every_n_steps=12,
+                         callbacks=[EarlyStopping(monitor="val_accuracy", patience=3, mode="max")]
+                        )
+    trainer.fit(model, datamodule=datamodule)
+    trainer.save_checkpoint(f'/nfs/research/goldman/jenny/Protein Sequencing/checkpoints/checkpoint{log_num}.ckpt')
+    
+    print('Testing model...')
+    test_metrics = trainer.test(model, datamodule=datamodule)
+    
+    return test_metrics
